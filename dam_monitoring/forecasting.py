@@ -35,7 +35,9 @@ DEFAULT_HORIZON_DAYS = 30
 CHANGEPOINT_PRIOR_SCALE = 0.001
 
 
-def _fit_one(df: pd.DataFrame, column: str, horizon_days: int) -> pd.DataFrame:
+def _fit_one(
+    df: pd.DataFrame, column: str, horizon_days: int, hourly_precision: bool = False
+) -> pd.DataFrame:
     from prophet import Prophet  # heavy import: only paid when forecasting runs
 
     prophet_df = (
@@ -43,6 +45,18 @@ def _fit_one(df: pd.DataFrame, column: str, horizon_days: int) -> pd.DataFrame:
         .rename(columns={"timestamp": "ds", column: "y"})
         .dropna()
     )
+
+    if not hourly_precision:
+        # None of weekly/monthly/quarterly/yearly seasonality needs hourly
+        # resolution to detect, and fit time scales with row count -- this
+        # is a ~65x speedup (measured: ~9.4s -> ~0.14s per column on 2
+        # years of hourly data). Trade-off: the model never sees hourly
+        # noise, so it can't represent intra-day patterns and its
+        # confidence bands will be tighter than they would be if trained on
+        # the raw hourly series.
+        prophet_df = (
+            prophet_df.set_index("ds").resample("D").mean().reset_index().dropna()
+        )
 
     model = Prophet(
         weekly_seasonality=True,
@@ -76,6 +90,7 @@ def forecast_all(
     horizon_days: int = MAX_HORIZON_DAYS,
     max_workers: int = 4,
     on_column_done: Optional[Callable[[str, Optional[pd.DataFrame], Optional[str]], None]] = None,
+    hourly_precision: bool = False,
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, str]]:
     """Fit + predict one Prophet model per column, in parallel threads.
 
@@ -93,6 +108,10 @@ def forecast_all(
     error_or_None) as soon as each column's fit finishes -- in actual
     completion order, not submission order -- so a caller (e.g. the GUI)
     can show results progressively instead of waiting for every column.
+
+    hourly_precision: fit on the raw hourly series instead of the default
+    daily-aggregated one (see _fit_one) -- much slower, but confidence
+    bands reflect real hourly volatility instead of being smoothed away.
     """
     columns = list(columns)
     forecasts: Dict[str, pd.DataFrame] = {}
@@ -100,7 +119,7 @@ def forecast_all(
 
     def run(column: str):
         try:
-            return column, _fit_one(df, column, horizon_days), None
+            return column, _fit_one(df, column, horizon_days, hourly_precision), None
         except Exception as exc:
             return column, None, str(exc)
 

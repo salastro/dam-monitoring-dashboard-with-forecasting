@@ -17,6 +17,7 @@ from PyQt5.QtCore import QFileSystemWatcher, Qt, QThread, QTimer, QUrl, pyqtSign
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
+    QCheckBox,
     QFileDialog,
     QLabel,
     QMainWindow,
@@ -55,12 +56,13 @@ class ForecastWorker(QThread):
     # GUI can show results progressively instead of waiting for all of them.
     column_ready = pyqtSignal(str, str, object, object)
 
-    def __init__(self, df, path, columns, horizon_days):
+    def __init__(self, df, path, columns, horizon_days, hourly_precision=False):
         super().__init__()
         self._df = df
         self._path = path
         self._columns = columns
         self._horizon_days = horizon_days
+        self._hourly_precision = hourly_precision
 
     def run(self):
         def on_column_done(column, result, error):
@@ -70,6 +72,7 @@ class ForecastWorker(QThread):
             forecasts, errors = forecast_all(
                 self._df, self._columns, horizon_days=self._horizon_days,
                 on_column_done=on_column_done,
+                hourly_precision=self._hourly_precision,
             )
         except Exception as exc:
             self.failed.emit(self._path, str(exc))
@@ -107,6 +110,11 @@ class DamMonitoringWindow(QMainWindow):
         self._forecasts: dict = {}
         self._horizon_days = DEFAULT_HORIZON_DAYS
         self._pending_horizon_days = DEFAULT_HORIZON_DAYS
+        # Off by default: fit on daily-aggregated data (~65x faster) since
+        # none of the requested seasonalities need hourly resolution. On
+        # trades that speed back for confidence bands that reflect real
+        # hourly volatility instead of smoothing it away.
+        self._hourly_precision = False
         # Whether a fit is currently running -- drives the business logic
         # (queue vs. start, indicator visibility). Deliberately separate
         # from the QThread objects themselves: those must stay alive until
@@ -154,6 +162,18 @@ class DamMonitoringWindow(QMainWindow):
         self.horizon_label = QLabel(f"{DEFAULT_HORIZON_DAYS}d")
         self.horizon_label.setFixedWidth(36)
         toolbar.addWidget(self.horizon_label)
+
+        toolbar.addSeparator()
+        self.hourly_precision_checkbox = QCheckBox("Hourly precision")
+        self.hourly_precision_checkbox.setChecked(self._hourly_precision)
+        self.hourly_precision_checkbox.setToolTip(
+            "Off (default): fit forecasts on daily-aggregated data, ~65x faster.\n"
+            "On: fit on raw hourly data -- much slower, but confidence bands\n"
+            "reflect real hourly volatility instead of smoothing it away.\n"
+            "Toggling immediately re-fits the current file."
+        )
+        self.hourly_precision_checkbox.toggled.connect(self._on_hourly_precision_toggled)
+        toolbar.addWidget(self.hourly_precision_checkbox)
 
         # Loading indicator for the (slow, background) Prophet fit -- an
         # indeterminate progress bar since we don't have real progress
@@ -275,6 +295,15 @@ class DamMonitoringWindow(QMainWindow):
             # Cheap: re-slices the already-computed forecast, no refit.
             self._build_and_render(self._df, in_place=True)
 
+    def _on_hourly_precision_toggled(self, checked: bool):
+        self._hourly_precision = checked
+        # Unlike the horizon slider, this changes what the model was
+        # trained on, not just how much of its output to show -- a refit
+        # is required. If a fit is already running (with the old setting),
+        # this coalesces and starts fresh right after it finishes.
+        if self._df is not None and self._csv_path is not None:
+            self._request_forecast_refit(self._df, self._csv_path)
+
     # --- Background Prophet forecasting --------------------------------
 
     def _request_forecast_refit(self, df, path: str):
@@ -293,7 +322,9 @@ class DamMonitoringWindow(QMainWindow):
         self.forecast_status_label.setText(f"Forecasting… (0/{self._forecast_columns_total})")
         self._fitting = True
 
-        worker = ForecastWorker(df, path, FORECAST_COLUMNS, MAX_HORIZON_DAYS)
+        worker = ForecastWorker(
+            df, path, FORECAST_COLUMNS, MAX_HORIZON_DAYS, self._hourly_precision
+        )
         worker.finished_ok.connect(self._on_forecast_ready)
         worker.failed.connect(self._on_forecast_thread_failed)
         worker.column_ready.connect(self._on_forecast_column_ready)
