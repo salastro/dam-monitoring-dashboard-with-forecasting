@@ -28,4 +28,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: DamMonitoringDashboard-windows
-          path: dist/DamMonitoringDashboard/
+          path: dist/DamMonitoringDashboard.exe
