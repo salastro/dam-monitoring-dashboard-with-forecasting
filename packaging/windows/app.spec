@@ -27,6 +27,12 @@ datas = [
     # ... (see prophet/models.py) -- this relative path must be preserved
     # exactly inside the frozen app.
     (os.path.join(PROPHET_DIR, "stan_model"), os.path.join("prophet", "stan_model")),
+    # prophet/__init__.py reads this via a raw `open(__file__.parent /
+    # "__version__.py")` rather than importing it, so PyInstaller's
+    # collectors -- which treat .py files as import-only source -- never
+    # pick it up as data on their own. Without it, `import prophet` raises
+    # FileNotFoundError inside every single forecast fit.
+    (os.path.join(PROPHET_DIR, "__version__.py"), "prophet"),
 ]
 # Any other package data these ship (e.g. plotly's bundled plotly.min.js,
 # used by our include_plotlyjs=True calls in gui.py).
@@ -57,8 +63,11 @@ pyz = PYZ(a.pure, a.zipped_data)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
     [],
-    exclude_binaries=True,
+    exclude_binaries=False,
     name=APP_NAME,
     debug=False,
     bootloader_ignore_signals=False,
@@ -67,18 +76,12 @@ exe = EXE(
     console=False,
 )
 
-# --onedir-equivalent layout (not --onefile): QtWebEngine ships a large
-# Chromium bundle (helper process, locales, ICU data); onefile's
-# extract-to-temp-dir-on-launch pattern is fragile for that and prone to
-# antivirus false positives. This produces dist/DamMonitoringDashboard/
-# as a folder you run the .exe from directly.
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    name=APP_NAME,
-)
+# --onefile: everything (including QtWebEngine's Chromium bundle -- helper
+# process, locales, ICU data -- and Prophet/cmdstan's binaries) is packed
+# into this single .exe. At each launch the bootloader extracts it all to
+# a fresh %TEMP%\_MEI... directory before the app actually starts, so
+# startup is slower than the onedir layout and a large self-extracting
+# .exe is more likely to trip antivirus heuristics. Chosen anyway per
+# project requirement to ship one file instead of an exe + _internal/
+# folder. Output is dist/DamMonitoringDashboard.exe directly (no COLLECT
+# step / no dist/DamMonitoringDashboard/ folder).

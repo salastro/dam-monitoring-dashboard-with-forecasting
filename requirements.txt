@@ -1,5 +1,5 @@
 pandas>=2.2
 plotly>=5.24
-PyQt5>=5.15
-PyQtWebEngine>=5.15
+PyQt6>=6.4
+PyQt6-WebEngine>=6.4
 prophet>=1.1

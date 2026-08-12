@@ -179,6 +179,8 @@ def build_figure(
             floor=floor,
             ceiling_emphasis_color="crimson",
             floor_emphasis_color="darkblue",
+            forecasts=forecasts,
+            forecast_horizon_days=forecast_horizon_days,
         )
 
     # 2. Discharge & Chlorophyll-a - different units, independent scales
@@ -196,6 +198,8 @@ def build_figure(
             columns="discharge_m3s",
             ceiling=cfg.get("ceiling"),
             floor=cfg.get("floor"),
+            forecasts=forecasts,
+            forecast_horizon_days=forecast_horizon_days,
         )
     if "chlorophyll_a_ugL" in thresholds:
         cfg = thresholds["chlorophyll_a_ugL"]
@@ -204,6 +208,8 @@ def build_figure(
             columns="chlorophyll_a_ugL",
             ceiling=cfg.get("ceiling"),
             floor=cfg.get("floor"),
+            forecasts=forecasts,
+            forecast_horizon_days=forecast_horizon_days,
         )
 
     # 3. Structural displacement (horizontal vs vertical) - same unit (mm), independent scales
@@ -222,6 +228,8 @@ def build_figure(
             columns=disp_cols,
             ceiling=cfg.get("ceiling"),
             floor=cfg.get("floor"),
+            forecasts=forecasts,
+            forecast_horizon_days=forecast_horizon_days,
         )
 
     # 4. Seismic acceleration - own units (g)
@@ -238,6 +246,8 @@ def build_figure(
             columns="seismic_acc_g",
             ceiling=cfg.get("ceiling"),
             floor=cfg.get("floor"),
+            forecasts=forecasts,
+            forecast_horizon_days=forecast_horizon_days,
         )
 
     # 5. Water temperature & pH - different units, use secondary y-axis
@@ -253,6 +263,8 @@ def build_figure(
             columns="pH",
             ceiling=cfg.get("ceiling"),
             floor=cfg.get("floor"),
+            forecasts=forecasts,
+            forecast_horizon_days=forecast_horizon_days,
         )
 
     # 6. TDS & DO - both mg/L, independent scales
@@ -271,6 +283,8 @@ def build_figure(
             columns=tds_do_cols,
             ceiling=cfg.get("ceiling"),
             floor=cfg.get("floor"),
+            forecasts=forecasts,
+            forecast_horizon_days=forecast_horizon_days,
         )
 
     fig.update_xaxes(title_text="Timestamp", row=6, col=1)

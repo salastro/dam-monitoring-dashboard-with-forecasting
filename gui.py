@@ -11,11 +11,32 @@ with a slider to control how far into the future is displayed.
 
 import atexit
 import os
+import subprocess
+import sys
 import tempfile
 
-from PyQt5.QtCore import QFileSystemWatcher, Qt, QThread, QTimer, QUrl, pyqtSignal
-from PyQt5.QtWidgets import (
-    QAction,
+import plotly
+import plotly.offline as pyo
+
+if sys.platform == "win32":
+    # cmdstanpy shells out to the compiled Stan model binary (one call per
+    # forecast column, in parallel) via plain subprocess.Popen with no
+    # creationflags. A windowed .exe (no console of its own) has nothing
+    # for that console-subsystem child to attach to, so Windows pops a
+    # brand new console window for every single one -- several flashing
+    # in sequence each time a CSV is imported. Patched here, once, since
+    # cmdstanpy itself doesn't offer a way to suppress it.
+    _orig_popen_init = subprocess.Popen.__init__
+
+    def _popen_init_no_window(self, *args, **kwargs):
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | subprocess.CREATE_NO_WINDOW
+        _orig_popen_init(self, *args, **kwargs)
+
+    subprocess.Popen.__init__ = _popen_init_no_window
+
+from PyQt6.QtCore import QFileSystemWatcher, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QAction
+from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QFileDialog,
@@ -25,11 +46,13 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QSlider,
     QStatusBar,
+    QStyle,
+    QSystemTrayIcon,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
-from PyQt5.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 from dam_monitoring import (
     DEFAULT_HORIZON_DAYS,
@@ -85,6 +108,12 @@ class DamMonitoringWindow(QMainWindow):
     # always find it regardless of which render produced the current page.
     _CHART_DIV_ID = "dam-chart"
 
+    # Live-reload rows arrive one hour at a time, but refitting Prophet on
+    # every single one is wasteful -- the forecast a few hours out barely
+    # moves. The chart itself still redraws on every reload; only the
+    # (expensive) refit is throttled to roughly once per new day of data.
+    _FORECAST_REFIT_INTERVAL_ROWS = 24
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Dam Monitoring Dashboard")
@@ -110,6 +139,30 @@ class DamMonitoringWindow(QMainWindow):
         self._forecasts: dict = {}
         self._horizon_days = DEFAULT_HORIZON_DAYS
         self._pending_horizon_days = DEFAULT_HORIZON_DAYS
+        # Row count of the df as of the last time a refit was requested --
+        # compared against the live-reloaded df's row count to gate
+        # automatic refits (see _FORECAST_REFIT_INTERVAL_ROWS). Kept in
+        # sync inside _request_forecast_refit itself, so every caller
+        # (live reload, a new file, the hourly-precision toggle) resets it
+        # the same way regardless of which one triggered the refit.
+        self._forecast_row_count = 0
+        # (column, "ceiling"/"floor") pairs already alerted on for the
+        # current file -- a forecast still predicting the same breach on
+        # its next routine refit shouldn't re-notify every time. Cleared
+        # when a genuinely new file is opened (see load_csv), or sooner if
+        # the breach itself clears (see _clear_active_breach).
+        self._notified_forecast_breaches: set = set()
+        # (column, "ceiling"/"floor") -> (threshold, first-breach timestamp)
+        # for whichever breaches the *current* forecast still predicts --
+        # drives the persistent warning banner, unlike the one-time toast.
+        self._active_forecast_breaches: dict = {}
+        self._tray_icon = None
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray_icon = QSystemTrayIcon(
+                self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning), self
+            )
+            self._tray_icon.setToolTip("Dam Monitoring Dashboard")
+            self._tray_icon.show()
         # Off by default: fit on daily-aggregated data (~65x faster) since
         # none of the requested seasonalities need hourly resolution. On
         # trades that speed back for confidence bands that reflect real
@@ -133,11 +186,27 @@ class DamMonitoringWindow(QMainWindow):
 
         self.web_view = QWebEngineView()
         self._chart_ready = False
+        # A figure that arrived (e.g. a progressive forecast-column reveal)
+        # while a full-page navigation was already in flight -- applied via
+        # Plotly.react once that navigation finishes, instead of starting a
+        # second, competing navigation (see _build_and_render).
+        self._pending_fig = None
         self.web_view.loadFinished.connect(self._on_load_finished)
 
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        # Persistent (not auto-expiring, unlike the status bar) banner for
+        # forecasts currently predicting a critical breach -- shown until
+        # the forecast no longer predicts it or a different file is opened.
+        self.forecast_warning_banner = QLabel("")
+        self.forecast_warning_banner.setStyleSheet(
+            "background-color: #b71c1c; color: white; padding: 6px 10px; font-weight: bold;"
+        )
+        self.forecast_warning_banner.setWordWrap(True)
+        self.forecast_warning_banner.setVisible(False)
+        layout.addWidget(self.forecast_warning_banner)
         layout.addWidget(self.web_view)
         self.setCentralWidget(central)
 
@@ -152,7 +221,7 @@ class DamMonitoringWindow(QMainWindow):
 
         toolbar.addSeparator()
         toolbar.addWidget(QLabel("Forecast horizon:"))
-        self.horizon_slider = QSlider(Qt.Horizontal)
+        self.horizon_slider = QSlider(Qt.Orientation.Horizontal)
         self.horizon_slider.setMinimum(1)
         self.horizon_slider.setMaximum(MAX_HORIZON_DAYS)
         self.horizon_slider.setValue(DEFAULT_HORIZON_DAYS)
@@ -199,6 +268,9 @@ class DamMonitoringWindow(QMainWindow):
 
     def _on_load_finished(self, ok: bool):
         self._chart_ready = bool(ok)
+        if self._chart_ready and self._pending_fig is not None:
+            fig, self._pending_fig = self._pending_fig, None
+            self._update_figure(fig)
 
     def _show_placeholder(self):
         self.web_view.setHtml(
@@ -239,6 +311,9 @@ class DamMonitoringWindow(QMainWindow):
         is_new_file = path != self._csv_path
         if is_new_file:
             self._forecasts = {}
+            self._notified_forecast_breaches = set()
+            self._active_forecast_breaches = {}
+            self.forecast_warning_banner.setVisible(False)
 
         self._df = df
         self._build_and_render(df, in_place=in_place and not is_new_file)
@@ -246,7 +321,14 @@ class DamMonitoringWindow(QMainWindow):
         self.path_label.setText(path)
         self._csv_path = path
         self._watch_path(path)
-        self._request_forecast_refit(df, path)
+
+        # Chart re-renders above happen on every reload regardless; the
+        # (expensive) refit itself only fires for a new file or once enough
+        # new rows have piled up since the last one (see
+        # _FORECAST_REFIT_INTERVAL_ROWS).
+        rows_since_forecast = len(df) - self._forecast_row_count
+        if is_new_file or rows_since_forecast >= self._FORECAST_REFIT_INTERVAL_ROWS:
+            self._request_forecast_refit(df, path)
 
     def _build_and_render(self, df, *, in_place: bool):
         try:
@@ -263,6 +345,16 @@ class DamMonitoringWindow(QMainWindow):
 
         if in_place and self._chart_ready:
             self._update_figure(fig)
+        elif in_place:
+            # A full-page navigation is already in flight (e.g. the initial
+            # render for a large CSV can take many seconds, while forecast
+            # columns keep completing in the background). Starting another
+            # navigation here would cancel it mid-load -- possibly mid-way
+            # through executing the inline plotly.js bundle -- leaving
+            # `Plotly` undefined on whatever page ends up on screen. Just
+            # remember the latest figure; _on_load_finished applies it via
+            # Plotly.react once the in-flight navigation actually completes.
+            self._pending_fig = fig
         else:
             self._render_figure(fig)
 
@@ -307,6 +399,7 @@ class DamMonitoringWindow(QMainWindow):
     # --- Background Prophet forecasting --------------------------------
 
     def _request_forecast_refit(self, df, path: str):
+        self._forecast_row_count = len(df)
         if self._fitting:
             # A fit is already running and fitting is far slower than
             # reloads can arrive; keep only the latest request and run it
@@ -355,9 +448,78 @@ class DamMonitoringWindow(QMainWindow):
             # the same in-place Plotly.react path as any other redraw --
             # zoom/pan stay put (uirevision), no full page reload.
             self._forecasts[column] = forecast_df
+            self._check_forecast_breach(column, forecast_df)
             self._build_and_render(self._df, in_place=True)
         # else: this column's error is folded into the summary message
         # _on_forecast_ready shows once the whole fit cycle finishes.
+
+    def _check_forecast_breach(self, column: str, forecast_df):
+        """Re-evaluate whether `column`'s forecast currently crosses its
+        configured ceiling/floor anywhere in the horizon -- a predicted
+        future breach, not just an already-observed one. Unlike the
+        one-time toast (deduped via _notified_forecast_breaches), the GUI
+        banner (_active_forecast_breaches) reflects the *current* state:
+        it's added when a breach first shows up and removed the moment a
+        later forecast no longer predicts it, not just once per file.
+        """
+        cfg = DEFAULT_THRESHOLDS.get(column)
+        if not cfg or forecast_df is None or forecast_df.empty:
+            self._clear_active_breach(column, "ceiling")
+            self._clear_active_breach(column, "floor")
+            return
+
+        ceiling = cfg.get("ceiling")
+        if ceiling is not None:
+            over = forecast_df[forecast_df["yhat"] > ceiling]
+            if not over.empty:
+                self._set_active_breach(column, "ceiling", ceiling, over["ds"].iloc[0])
+            else:
+                self._clear_active_breach(column, "ceiling")
+
+        floor = cfg.get("floor")
+        if floor is not None:
+            under = forecast_df[forecast_df["yhat"] < floor]
+            if not under.empty:
+                self._set_active_breach(column, "floor", floor, under["ds"].iloc[0])
+            else:
+                self._clear_active_breach(column, "floor")
+
+    def _set_active_breach(self, column: str, kind: str, threshold: float, when):
+        self._active_forecast_breaches[(column, kind)] = (threshold, when)
+        self._refresh_forecast_warning_banner()
+        if (column, kind) not in self._notified_forecast_breaches:
+            self._notified_forecast_breaches.add((column, kind))
+            self._notify_critical_threshold(column, kind, threshold, when)
+
+    def _clear_active_breach(self, column: str, kind: str):
+        if self._active_forecast_breaches.pop((column, kind), None) is not None:
+            # Let a breach that clears and later reoccurs toast again --
+            # "already notified" should mean "still ongoing", not "ever
+            # happened once for this file".
+            self._notified_forecast_breaches.discard((column, kind))
+            self._refresh_forecast_warning_banner()
+
+    def _refresh_forecast_warning_banner(self):
+        if not self._active_forecast_breaches:
+            self.forecast_warning_banner.setVisible(False)
+            return
+        parts = []
+        for (column, kind), (threshold, when) in sorted(self._active_forecast_breaches.items()):
+            verb = "exceed ceiling" if kind == "ceiling" else "fall below floor"
+            parts.append(f"{column} forecast to {verb} ({threshold}) around {when:%Y-%m-%d %H:%M}")
+        self.forecast_warning_banner.setText("⚠ " + "  |  ".join(parts))
+        self.forecast_warning_banner.setVisible(True)
+
+    def _notify_critical_threshold(self, column: str, kind: str, threshold: float, when):
+        verb = "exceed its ceiling" if kind == "ceiling" else "fall below its floor"
+        message = f"{column} is forecast to {verb} ({threshold}) around {when:%Y-%m-%d %H:%M}."
+        if self._tray_icon is not None and self._tray_icon.isVisible():
+            self._tray_icon.showMessage(
+                "Critical forecast threshold", message,
+                QSystemTrayIcon.MessageIcon.Critical, 10000,
+            )
+        else:
+            self.statusBar().showMessage(message, 10000)
 
     def _on_forecast_ready(self, path: str, forecasts: dict, errors: dict):
         self._fitting = False
@@ -388,17 +550,36 @@ class DamMonitoringWindow(QMainWindow):
 
     # --- Rendering -------------------------------------------------------
 
+    def _local_plotlyjs_url(self) -> str:
+        # A "cdn" reference would be fetched from https://cdn.plot.ly under
+        # file:// origin, which QtWebEngine's Chromium blocks under CORS --
+        # so instead, write the plotly.js build already bundled inside the
+        # installed `plotly` package (no network access needed) to a stable
+        # path once, and point every rendered page's <script src> at that
+        # single file. Versioned by plotly's own version so an upgrade
+        # regenerates it. This also means each render's HTML no longer has
+        # to re-embed ~5MB of JS text inline on every single reload.
+        path = os.path.join(
+            tempfile.gettempdir(), f"dam_monitoring_plotlyjs_{plotly.__version__}.js"
+        )
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(pyo.get_plotlyjs())
+        return QUrl.fromLocalFile(path).toString()
+
     def _render_figure(self, fig):
+        # This navigation supersedes anything an earlier in-flight load was
+        # still waiting to patch in.
+        self._pending_fig = None
         self._cleanup_tmp_file()
         fd, path = tempfile.mkstemp(suffix=".html")
         os.close(fd)
 
-        # Embed plotly.js inline: a "cdn" reference would be fetched from
-        # https://cdn.plot.ly under file:// origin, which QtWebEngine's
-        # Chromium blocks under CORS.
+        plotlyjs_url = self._local_plotlyjs_url()
+
         # responsive=True makes the plot re-fit its container on resize.
         chart_html = fig.to_html(
-            include_plotlyjs=True,
+            include_plotlyjs=False,
             full_html=False,
             config={"responsive": True},
             div_id=self._CHART_DIV_ID,
@@ -414,6 +595,7 @@ class DamMonitoringWindow(QMainWindow):
 <html>
 <head>
 <meta charset="utf-8">
+<script src="{plotlyjs_url}"></script>
 <style>
   html, body {{ margin: 0; padding: 0; height: 100%; }}
   body {{
@@ -472,15 +654,22 @@ class DamMonitoringWindow(QMainWindow):
 
     def _cleanup_tmp_file(self):
         if self._tmp_html_path and os.path.exists(self._tmp_html_path):
-            os.remove(self._tmp_html_path)
+            try:
+                os.remove(self._tmp_html_path)
+            except OSError:
+                # Still open by the QtWebEngine render process (e.g. a
+                # navigation to it was just superseded and hasn't released
+                # its handle yet on Windows) -- harmless to leave behind;
+                # the OS temp dir gets reaped eventually.
+                pass
         self._tmp_html_path = None
 
 
 def main():
-    app = QApplication([])
+    app = QApplication(sys.argv)
     window = DamMonitoringWindow()
     window.show()
-    app.exec_()
+    app.exec()
 
 
 if __name__ == "__main__":

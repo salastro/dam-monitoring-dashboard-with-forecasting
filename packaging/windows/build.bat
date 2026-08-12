@@ -81,8 +81,7 @@ if errorlevel 1 (
 
 echo.
 echo === Done ===
-echo The built app is in:  dist\DamMonitoringDashboard\
-echo Run it with:          dist\DamMonitoringDashboard\DamMonitoringDashboard.exe
+echo The built app is:  dist\DamMonitoringDashboard.exe
 exit /b 0
 
 :pip_error
